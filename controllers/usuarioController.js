@@ -1,7 +1,98 @@
-const jwt = require('jsonwebtoken');
-require("dotenv-safe").config();
+const { pool } = require('../config');
+const Usuario = require('../entities/usuario');
 
-const {
+const montaUsuario = (row) => new Usuario(row.email, row.nome, row.telefone, row.tipo);
+
+const getUsuariosDB = async () => {
+    try {    
+        const { rows } = await pool.query('SELECT * FROM usuarios ORDER BY nome');
+        return rows.map(montaUsuario);        
+    } catch (err) {
+        throw "Erro : " + err;
+    }
+}
+
+const addUsuarioDB = async (body, tipoPadrao = 'U') => {
+    try {   
+        const { nome, email, telefone, senha } = body; 
+        const tipo = tipoPadrao;
+        if (!nome || !email || !telefone || !senha) {
+            throw "Informe nome, email, telefone e senha.";
+        }
+        const results = await pool.query(`INSERT INTO usuarios (nome, email, tipo, telefone, senha) 
+            VALUES ($1, $2, $3, $4, $5)
+            returning nome, email, tipo, telefone`,
+        [nome, email, tipo, telefone, senha]);
+        const l = results.rows[0];
+        return montaUsuario(l); 
+    } catch (err) {
+        throw "Erro ao inserir o usuario: " + err;
+    }    
+}
+
+const updateUsuarioDB = async (body, email) => {
+    try {   
+        const { nome, email: novoEmail, telefone, senha, tipo } = body; 
+        if (!nome || !novoEmail || !telefone) {
+            throw "Informe nome, email e telefone.";
+        }
+        // tipo is optional; when provided it will update, otherwise keep existing
+        const results = await pool.query(`UPDATE usuarios set nome = $2, email = $3, telefone = $4, senha = COALESCE(NULLIF($5, ''), senha), tipo = COALESCE(NULLIF($6, ''), tipo)
+            where email = $1 
+            returning nome, email, tipo, telefone`,
+        [email, nome, novoEmail, telefone, senha ?? '', tipo ?? '']);        
+        if (results.rowCount == 0){
+            throw `Nenhum registro encontrado com o email ${email} para ser alterado`;
+        }
+        const l = results.rows[0];
+        return montaUsuario(l);
+    } catch (err) {
+        throw "Erro ao alterar o usuario: " + err;
+    }      
+}
+
+const deleteUsuarioDB = async (email) => {
+    try {           
+        const results = await pool.query(`DELETE FROM usuarios where email = $1`,
+        [email]);
+        if (results.rowCount == 0){
+            throw `Nenhum registro encontrado com o email ${email} para ser removido`;
+        } else {
+            return "Usuario removido com sucesso";
+        }       
+    } catch (err) {
+        throw "Erro ao remover o usuario: " + err;
+    }     
+}
+
+const getUsuarioPorEmailDB = async (email) => {
+    try {           
+        const results = await pool.query(`SELECT * FROM usuarios where email = $1`,
+        [email]);
+        if (results.rowCount == 0){
+            throw "Nenhum registro encontrado com o email: " + email;
+        } else {
+            const l = results.rows[0];
+            return montaUsuario(l);
+        }       
+    } catch (err) {
+        throw "Erro ao recuperar o usuario: " + err;
+    }     
+}
+
+const getUsuarioLogadoDB = async (email) => {
+    return getUsuarioPorEmailDB(email);
+}
+
+const updateUsuarioLogadoDB = async (body, emailAtual) => {
+    return updateUsuarioDB(body, emailAtual);
+}
+
+const deleteUsuarioLogadoDB = async (email) => {
+    return deleteUsuarioDB(email);
+}
+
+module.exports = {
     getUsuariosDB,
     addUsuarioDB,
     updateUsuarioDB,
@@ -10,159 +101,4 @@ const {
     getUsuarioLogadoDB,
     updateUsuarioLogadoDB,
     deleteUsuarioLogadoDB
-} = require('../usecases/usuarioUseCases')
-
-const trataErroUsuario = (response, err) => {
-    const message = String(err?.message || err);
-    const usuarioNaoEncontrado = message.includes('Nenhum registro encontrado');
-
-    return response.status(usuarioNaoEncontrado ? 404 : 400).json({
-        status: 'error',
-        message: usuarioNaoEncontrado ? 'Usuario nao encontrado.' : message
-    });
-}
-
-const getUsuarios = async (request, response) => {
-    await getUsuariosDB()
-        .then(data => response.status(200).json(data))
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: 'Erro ao consultar os usuarios: ' + err
-        }));
-}
-
-const addUsuario = async (request, response) => {
-    await addUsuarioDB(request.body)
-        .then(data => response.status(201).json({
-            status: "success", message: "Usuario criado",
-            objeto: data
-        }))
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: err
-        }));
-}
-
-const updateUsuario = async (request, response) => {
-    const usuarioLogado = request.usuario;
-    if (!usuarioLogado || usuarioLogado.email !== request.params.email) {
-        return response.status(403).json({
-            status: 'error',
-            message: 'Acesso negado. Voce so pode alterar seu proprio cadastro.'
-        });
-    }
-
-    await updateUsuarioDB(request.body, request.params.email)
-        .then(data => {
-            const token = jwt.sign({ usuario: data }, process.env.SECRET, {
-                expiresIn: 300
-            });
-
-            response.status(200).json({
-                status: "success",
-                message: "Usuario alterado",
-                objeto: data,
-                auth: true,
-                token
-            });
-        })
-        .catch(err => trataErroUsuario(response, err));
-}
-
-const deleteUsuario = async (request, response) => {
-    const usuarioLogado = request.usuario;
-    const podeExcluir = usuarioLogado && (usuarioLogado.tipo === 'A' || usuarioLogado.email === request.params.email);
-    if (!podeExcluir) {
-        return response.status(403).json({
-            status: 'error',
-            message: 'Acesso negado. Voce so pode excluir seu proprio cadastro ou ser administrador.'
-        });
-    }
-
-    await deleteUsuarioDB(request.params.email)
-        .then(data => response.status(200).json({
-            status: "success", message: data
-        }))
-        .catch(err => trataErroUsuario(response, err));        
-}
-
-const getUsuarioPorEmail = async (request, response) => {
-    const usuarioLogado = request.usuario;
-    const podeConsultar = usuarioLogado && (usuarioLogado.tipo === 'A' || usuarioLogado.email === request.params.email);
-    if (!podeConsultar) {
-        return response.status(403).json({
-            status: 'error',
-            message: 'Acesso negado. Voce so pode consultar seu proprio cadastro ou ser administrador.'
-        });
-    }
-
-    await getUsuarioPorEmailDB(request.params.email)
-        .then(data => response.status(200).json(data))
-        .catch(err => trataErroUsuario(response, err));           
-}
-
-const addUsuarioPublico = async (request, response) => {
-    await addUsuarioDB(request.body, 'U')
-        .then(data => response.status(201).json({
-            status: "success",
-            message: "Usuario criado com sucesso",
-            objeto: data
-        }))
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: err
-        }));
-}
-
-const getMeuUsuario = async (request, response) => {
-    await getUsuarioLogadoDB(request.usuario.email)
-        .then(data => response.status(200).json(data))
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: err
-        }));
-}
-
-const updateMeuUsuario = async (request, response) => {
-    await updateUsuarioLogadoDB(request.body, request.usuario.email)
-        .then(data => {
-            const token = jwt.sign({ usuario: data }, process.env.SECRET, {
-                expiresIn: 300
-            });
-            response.status(200).json({
-                status: "success",
-                message: "Usuario alterado com sucesso",
-                objeto: data,
-                auth: true,
-                token
-            });
-        })
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: err
-        }));
-}
-
-const deleteMeuUsuario = async (request, response) => {
-    await deleteUsuarioLogadoDB(request.usuario.email)
-        .then(data => response.status(200).json({
-            status: "success",
-            message: data
-        }))
-        .catch(err => response.status(400).json({
-            status: 'error',
-            message: err
-        }));
-}
-
-module.exports = {
-    getUsuarios,
-    addUsuario,
-    updateUsuario,
-    deleteUsuario,
-    getUsuarioPorEmail,
-    addUsuarioPublico,
-    getMeuUsuario,
-    updateMeuUsuario,
-    deleteMeuUsuario
 }
